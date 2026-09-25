@@ -239,3 +239,132 @@ def test_coverage_missing_instrument_404(client):
                 ("end", "2026-02-01T00:00:00Z")],
     )
     assert r.status_code == 404
+
+
+def test_coverage_fractional_handoff_point_is_not_double_active(client):
+    # 回归：小数秒单点曾被 fmt 截为整秒，误判为两证闭区间交接点。
+    # 2026-06-01T00:00:00.500Z 在交接整秒之后，只有 CW-2 有效。
+    _submit(client)
+    r = client.get(
+        COVERAGE,
+        params=[("start", "2026-06-01T00:00:00.500Z"),
+                ("end", "2026-06-01T00:00:00.500Z")],
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # 响应保留精确微秒：窗口、网格、区段端点与 sample_at
+    assert data["window_start"] == "2026-06-01T00:00:00.500000Z"
+    assert data["window_end"] == "2026-06-01T00:00:00.500000Z"
+    assert data["grid_points"] == ["2026-06-01T00:00:00.500000Z"]
+    assert data["segment_count"] == 1
+    seg = data["segments"][0]
+    assert seg["start"] == seg["end"] == seg["sample_at"] == \
+        "2026-06-01T00:00:00.500000Z"
+    assert seg["start_inclusive"] is True and seg["end_inclusive"] is True
+    assert seg["resolution"] == "unique" and seg["valid"] is True
+    assert seg["conflict_codes"] == []
+    assert seg["starts"] == ["CW-2"]
+    # 单点窗口只覆盖该时刻：网格只有一个点，无开区间采样
+    assert data["statistics"] == {
+        "boundaries_in_window": 0, "grid_points": 1,
+        "point_samples": 1, "interval_samples": 0, "reports_evaluated": 1,
+    }
+
+
+def test_coverage_fractional_point_after_expiry_is_broken(client):
+    # 回归：截止 2027-01-01T00:00:00Z 之后的同秒小数秒不再被当成闭区间内。
+    _submit(client)
+    r = client.get(
+        COVERAGE,
+        params=[("start", "2027-01-01T00:00:00.500Z"),
+                ("end", "2027-01-01T00:00:00.500Z")],
+    )
+    assert r.status_code == 200, r.text
+    segs = r.json()["segments"]
+    assert len(segs) == 1
+    seg = segs[0]
+    assert seg["resolution"] == "broken" and seg["valid"] is False
+    assert "NO_ACTIVE_CERTIFICATE" in seg["conflict_codes"]
+    assert seg["sample_at"] == "2027-01-01T00:00:00.500000Z"
+
+
+def test_coverage_fractional_window_straddling_expiry_boundary(client):
+    # 窗口 [23:59:59.500, 次日 00:00:00.500]：整秒截止点本身仍属闭区间
+    # （unique，并入左侧段），该秒之后的小数秒位于边界之后（broken）。
+    _submit(client)
+    r = client.get(
+        COVERAGE,
+        params=[("start", "2026-12-31T23:59:59.500Z"),
+                ("end", "2027-01-01T00:00:00.500Z")],
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["grid_points"] == [
+        "2026-12-31T23:59:59.500000Z",
+        "2027-01-01T00:00:00Z",
+        "2027-01-01T00:00:00.500000Z",
+    ]
+    segs = data["segments"]
+    assert [s["resolution"] for s in segs] == ["unique", "broken"]
+    valid_seg, broken_seg = segs
+    # 左侧段含小数秒窗口起点与整秒截止点本身（闭区间）
+    assert valid_seg["start"] == "2026-12-31T23:59:59.500000Z"
+    assert valid_seg["start_inclusive"] is True
+    assert valid_seg["end"] == "2027-01-01T00:00:00Z"
+    assert valid_seg["end_inclusive"] is True
+    # 右侧段从整秒边界之后开始（不含边界点），到小数秒窗口终点（含）
+    assert broken_seg["start"] == "2027-01-01T00:00:00Z"
+    assert broken_seg["start_inclusive"] is False
+    assert broken_seg["end"] == "2027-01-01T00:00:00.500000Z"
+    assert broken_seg["end_inclusive"] is True
+    assert broken_seg["sample_at"] == "2027-01-01T00:00:00.250000Z"
+    assert "NO_ACTIVE_CERTIFICATE" in broken_seg["conflict_codes"]
+
+
+def test_coverage_fractional_window_inside_handoff_second(client):
+    # 交接秒内的两个小数秒点之间只有 CW-2，整秒交接点不在窗内不成段。
+    _submit(client)
+    r = client.get(
+        COVERAGE,
+        params=[("start", "2026-06-01T00:00:00.100Z"),
+                ("end", "2026-06-01T00:00:00.900Z")],
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["grid_points"] == [
+        "2026-06-01T00:00:00.100000Z",
+        "2026-06-01T00:00:00.900000Z",
+    ]
+    assert data["segment_count"] == 1
+    seg = data["segments"][0]
+    assert seg["resolution"] == "unique" and seg["valid"] is True
+    assert seg["starts"] == ["CW-2"]
+    assert seg["conflict_codes"] == []
+
+
+def test_coverage_fractional_offset_input_is_converted_to_utc(client):
+    # 带时区偏移的小数秒输入换算为 UTC 后保留微秒精度。
+    _submit(client)
+    r = client.get(
+        COVERAGE,
+        params=[("start", "2026-06-01T02:00:00.500+02:00"),
+                ("end", "2026-06-01T02:00:00.500+02:00")],
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["window_start"] == data["window_end"] == \
+        "2026-06-01T00:00:00.500000Z"
+    assert data["segments"][0]["sample_at"] == "2026-06-01T00:00:00.500000Z"
+
+
+def test_coverage_rejects_inverted_fractional_window(client):
+    _submit(client)
+    r = client.get(
+        COVERAGE,
+        params=[("start", "2026-06-01T00:00:00.500Z"),
+                ("end", "2026-06-01T00:00:00.000Z")],
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert "不能晚于" in detail
+    assert "00:00:00.500000Z" in detail

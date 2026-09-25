@@ -1681,15 +1681,72 @@ def assess_deactivation(
 
 # ---------------------------------------------------------------- 仪器时间窗覆盖查询
 
-def _parse_ts(s: str) -> datetime:
-    """内部采样串解析（接受整秒 UTC 串及 ``Z\x7f`` 后缀的半开哨兵串）。"""
-    return datetime.strptime(s.rstrip("\x7f"), _TS_PARSE_FMT)
+
+def _display_ts(dt_value: datetime) -> str:
+    """对外展示用 UTC 串（整秒为 Z 结尾，保留时区换算后的微秒小数位）。"""
+    base = dt_value.strftime(_TS_PARSE_FMT[:-1])  # 去掉结尾 Z
+    if dt_value.microsecond:
+        base += f".{dt_value.microsecond:06d}"
+    return base + "Z"
+
+
+class _GridKey(str):
+    """网格时间点的比较串：与库内整秒串字典序可比，但保持真实时间顺序。
+
+    证书/边的有效期在库中始终按整秒串（``...SSZ``，写入经 ``fmt`` 规范化）
+    存储并以字符串字典序比较。查询窗端点可能带小数秒，直接把
+    ``...SS.ffffffZ`` 放入比较会错序——它字典序位于 ``...SSZ`` **之前**，
+    于是同一秒的小数秒点会被排到该整秒边界之前：既误把闭区间交接点
+    当成两证同时有效（双证冲突误报），也会让截止后的同秒点仍落在闭
+    区间内（失效误报有效）。
+
+    规则：
+
+    * 整秒点就是普通 ``...SSZ``，边界本身仍按闭区间参与评估；
+    * 小数秒点在整秒串基础上插入位于秒位字符之后、``"Z"`` 之前的
+      ``"["`` 哨兵及 6 位微秒，得到 ``...SS[.ffffffZ``：它严格位于
+      ``...SSZ``（该秒整秒边界）与下一秒串之间（``"["`` ASCII 大于
+      ``"Z"``，而下一秒的差异在更早的秒位数字上），并按微秒数值在秒内
+      排序。
+
+    ``str()``/格式化对外仍呈现规范 ISO 串（不带哨兵），保证冲突中文
+    明细不泄漏内部哨兵。
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, dt_value: datetime) -> "_GridKey":
+        base = dt_value.strftime(_TS_PARSE_FMT[:-1])
+        if dt_value.microsecond:
+            raw = f"{base}[.{dt_value.microsecond:06d}Z"
+        else:
+            raw = base + "Z"
+        return super().__new__(cls, raw)
+
+    def __str__(self) -> str:
+        return _display_ts(self.as_dt())
+
+    def __format__(self, format_spec: str) -> str:
+        return format(str(self), format_spec)
+
+    @property
+    def microsecond(self) -> int:
+        return self.as_dt().microsecond
+
+    def as_dt(self) -> datetime:
+        """还原为 naive UTC datetime（仅用于展示与区间中点计算）。"""
+        raw = str.__str__(self)
+        if "[" in raw:
+            raw = raw.replace("[", "", 1)
+        if "." in raw:
+            return datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S.%fZ")
+        return datetime.strptime(raw, _TS_PARSE_FMT)
 
 
 def _collect_relevant_boundaries(
-    cat: Catalog, instrument_code: str, lo_s: str, hi_s: str
-) -> set[str]:
-    """收集窗口内与该仪器溯源评估相关的全部有效期边界。
+    cat: Catalog, instrument_code: str, lo: datetime, hi: datetime
+) -> set[datetime]:
+    """收集窗口内与该仪器溯源评估相关的全部有效期边界（naive UTC）。
 
     范围 = 该仪器全部证书 → 沿“子→父”边闭包可达的全部证书与边
     （国家基准证书一并纳入，保证根节点检查一致）；各证书/边的
@@ -1714,10 +1771,11 @@ def _collect_relevant_boundaries(
         for e in cat.out_edges.get(cid, []):
             stack.append(e["parent_cert_id"])
 
-    boundaries: set[str] = set()
+    boundaries: set[datetime] = set()
 
-    def clamp_add(ts: str) -> None:
-        if lo_s <= ts <= hi_s:
+    def clamp_add(ts_s: str) -> None:
+        ts = datetime.strptime(ts_s, _TS_PARSE_FMT)
+        if lo <= ts <= hi:
             boundaries.add(ts)
 
     for cid in relevant_certs:
@@ -1730,35 +1788,22 @@ def _collect_relevant_boundaries(
     return boundaries
 
 
-def _interior_moment(lo_s: str, hi_s: str) -> tuple[str, datetime]:
-    """两个整秒网格点之间严格位于内部的采样时刻。
+def _interior_moment(lo_dt: datetime, hi_dt: datetime) -> datetime:
+    """两个相邻网格点之间严格位于开区间内部的采样时刻（naive UTC）。
 
-    跨度 >=2 秒取整秒中点；跨度 1 秒时取后半秒，并在内部串上追加
-    ``\\x7f`` 哨兵后缀，使其字符串序严格位于整秒点 ``tZ`` 与
-    ``t+1sZ`` 之间（时间存储串按字典序比较）。内部串只用于本次查询，
-    既不入库也不出现在响应中（响应的 sample_at 给出真实采样时刻）。
+    跨度 >=2 秒取整秒中点；跨度 1 秒时取后半秒（.500000）；跨度更短
+    （端点本身带小数秒）时取真实中点。采样点永不等于任一端点。
     """
-    lo_dt, hi_dt = _parse_ts(lo_s), _parse_ts(hi_s)
     mid = lo_dt + (hi_dt - lo_dt) / 2
     if (hi_dt - lo_dt) >= timedelta(seconds=2):
-        sample = mid.replace(microsecond=0)
-    else:
-        sample = mid
-    return fmt(sample) + ("\x7f" if sample.microsecond else ""), sample
+        mid = mid.replace(microsecond=0)
+    return mid
 
 
 def _sample_key(report: dict[str, Any]) -> tuple:
     """区段合并依据：状态 + 有效性 + 冲突码多重集（含数量，保序）。"""
     codes = tuple(sorted(c["code"] for c in report["conflicts"]))
     return (report["resolution"], report["valid"], codes)
-
-
-def _display_ts(dt_value: datetime) -> str:
-    """对外展示用 UTC 串（整秒为 Z 结尾，半开采样保留微秒）。"""
-    base = dt_value.strftime(_TS_PARSE_FMT[:-1])  # 去掉结尾 Z
-    if dt_value.microsecond:
-        base += f".{dt_value.microsecond:06d}"
-    return base + "Z"
 
 
 def build_window_report(
@@ -1769,8 +1814,14 @@ def build_window_report(
 ) -> dict[str, Any]:
     """按有效期边界把 [start, end]（UTC 闭区间）划分为状态区段。
 
+    输入时间先完成时区换算并**保留微秒精度**，窗口网格按真实时间顺序
+    建立（见 ``_GridKey``），避免小数秒被截成整秒后错序：
+
     1. 收集与该仪器相关证书/溯源边在窗内的全部有效期边界；
-    2. 边界点（闭区间端点）与相邻边界间开区间分别评估现有校验报告；
+    2. 在每个**网格点**（整秒边界按闭区间端点，属于闭区间；带小数秒的
+       窗口端点按其真实时刻）与每对相邻网格点之间的**开区间内部**各
+       评估一次现有校验报告——整秒边界之后的任意小数秒位于边界之后，
+       不会被当成闭区间交接点；
     3. 仅当状态、有效性、冲突码多重集相同且端点严格连续时才合并，
        每段显式标明 start_inclusive / end_inclusive，
        避免闭区间交接时吞掉仅存在于瞬时（边界点）的冲突。
@@ -1779,35 +1830,40 @@ def build_window_report(
     end_naive = to_utc_naive(end)
     if start_naive > end_naive:
         raise ValidationError(
-            f"时间窗起点 {fmt(start_naive)} 不能晚于终点 {fmt(end_naive)}"
+            f"时间窗起点 {_display_ts(start_naive)} 不能晚于终点 "
+            f"{_display_ts(end_naive)}"
         )
-    lo_s = fmt(start_naive)
-    hi_s = fmt(end_naive)
 
     instrument = get_instrument(conn, instrument_code)
     if instrument is None:
         raise KeyError(instrument_code)
 
     cat = Catalog(conn)
-    boundaries = _collect_relevant_boundaries(cat, instrument_code, lo_s, hi_s)
-    grid = sorted({lo_s, hi_s, *boundaries})
+    boundaries = _collect_relevant_boundaries(
+        cat, instrument_code, start_naive, end_naive
+    )
+    grid_dt = sorted({start_naive, end_naive, *boundaries})
+    grid = [_GridKey(t) for t in grid_dt]
 
-    # 原子段：(起点, 终点, 起点是否包含, 终点是否包含, 代表报告, 真实采样时刻)
-    atoms: list[tuple[str, str, bool, bool, dict[str, Any], datetime]] = []
+    # 原子段：(起点 key, 终点 key, 起点是否包含, 终点是否包含,
+    #          代表报告, 真实采样时刻 datetime)
+    atoms: list[tuple[_GridKey, _GridKey, bool, bool, dict[str, Any], datetime]] = []
     for idx, t in enumerate(grid):
-        if lo_s <= t <= hi_s:
-            atoms.append(
-                (t, t, True, True, _build_report(cat, instrument_code, t),
-                 _parse_ts(t))
-            )
+        # 点原子：每个网格点按其真实时刻评估，零长度、两端都含。
+        # 整秒点 = 证书/边闭区间边界本身；小数秒点（仅可能是带小数秒
+        # 的窗口端点）与其相邻开区间同态，合并后正确呈现端点包含性。
+        atoms.append(
+            (t, t, True, True, _build_report(cat, instrument_code, t),
+             t.as_dt())
+        )
         if idx + 1 < len(grid):
             t1, t2 = grid[idx], grid[idx + 1]
-            if t1 < t2 and lo_s <= t1 and t2 <= hi_s:
-                inner_s, inner_dt = _interior_moment(t1, t2)
-                atoms.append(
-                    (t1, t2, False, False,
-                     _build_report(cat, instrument_code, inner_s), inner_dt)
-                )
+            inner_dt = _interior_moment(t1.as_dt(), t2.as_dt())
+            atoms.append(
+                (t1, t2, False, False,
+                 _build_report(cat, instrument_code, _GridKey(inner_dt)),
+                 inner_dt)
+            )
 
     # 相邻且键相同才合并；端点包含性取最左/最右原子段
     merged: list[dict[str, Any]] = []
@@ -1841,6 +1897,9 @@ def build_window_report(
         rep = m.pop("_rep")
         sample_dt = m.pop("_sample_at")
         m.pop("_key")
+        # 出参一律渲染为规范 ISO 串（不带内部哨兵，保留微秒精度）
+        m["start"] = _display_ts(m["start"].as_dt())
+        m["end"] = _display_ts(m["end"].as_dt())
         m["resolution"] = rep["resolution"]
         m["valid"] = rep["valid"]
         m["conflict_codes"] = sorted({c["code"] for c in rep["conflicts"]})
@@ -1854,10 +1913,10 @@ def build_window_report(
 
     return {
         "instrument": instrument_code,
-        "window_start": lo_s,
-        "window_end": hi_s,
+        "window_start": _display_ts(start_naive),
+        "window_end": _display_ts(end_naive),
         "boundary_count": len(boundaries),
-        "grid_points": grid,
+        "grid_points": [str(t) for t in grid],
         "segment_count": len(segments),
         "segments": segments,
         "statistics": {

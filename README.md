@@ -60,10 +60,17 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（191 个用例）
+pytest -q        # 运行测试（197 个用例）
 ```
 
-> 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
+本地服务监听 **http://localhost:8000**（与 Docker Compose 映射端口一致）：
+接口根 `http://localhost:8000/`、Swagger `http://localhost:8000/docs`、
+健康检查 `http://localhost:8000/health`。
+
+> 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式；
+> 时间窗覆盖查询（`/api/coverage`）的 `start`/`end` 也接受小数秒
+> （如 `2026-06-01T00:00:00.500Z`）与时区偏移（如 `...+02:00`），
+> 时区换算后的微秒精度会原样保留在响应中，详见 [4.1 节](#41仪器时间窗覆盖查询get-apicoverageinstrument)。
 
 ---
 
@@ -329,9 +336,9 @@ curl -G "http://localhost:8000/api/coverage/INST-T1" \
 
 1. 收集与该仪器相关的证书与父子溯源边（从该仪器证书出发沿“子→父”闭包可达，
    含国家基准根证书）落在窗内的全部有效期边界 `valid_from / valid_until`；
-2. 窗口端点与这些边界合并去重、升序排列为评估网格 `grid_points`；
-3. 在**每个边界点**（证书/边有效期均为闭区间）与每对相邻边界之间的**开区间内部**
-   各运行一次现有时点校验报告（`/api/reports` 的同一引擎）；
+2. 窗口端点与这些边界合并去重、按**真实时间顺序**排列为评估网格 `grid_points`；
+3. 在**每个网格点**（证书/边的整秒边界按闭区间端点评估）与每对相邻网格点之间的
+   **开区间内部**各运行一次现有时点校验报告（`/api/reports` 的同一引擎）；
 4. 按时间顺序输出状态区段 `segments`：**仅当** `resolution`（状态）、`valid`
    （有效性）与冲突码多重集完全相同，且两端**严格连续**（端点时间相等且一含一不含）
    时才把相邻段合并。
@@ -383,6 +390,58 @@ curl -G "http://localhost:8000/api/coverage/INST-T1" \
 }
 ```
 
+**小数秒查询。** 证书/边的有效期边界恒为整秒（写入时规范化为
+`YYYY-MM-DDTHH:MM:SSZ`），但查询窗端点允许带小数秒
+（如 `.500Z`，也接受带时区偏移的 `...+02:00`）。服务端先做时区换算并
+**保留微秒精度**，再以真实时间顺序建立网格——整秒边界本身仍属于闭区间，
+而该秒之后的任意小数秒位于边界之后。因此：
+
+- 查询交接点之后的小数秒（如上例 `2026-06-01T00:00:00.500Z`）**不会**
+  被当成两证闭区间交接点，只有后证 `CW-2` 有效，不再误报双证书冲突；
+- 查询截止点之后的同秒小数秒（如证书 `valid_until=2027-01-01T00:00:00Z`
+  而查询 `2027-01-01T00:00:00.500Z`）**不**落在闭区间内，正确报失效；
+- **单点窗口只覆盖该时刻**：`start == end` 时网格仅此一点、只评估一次，
+  区段端点与 `sample_at` 均为该精确时刻；小数秒窗口的 `window_start` /
+  `window_end`、`grid_points`、区段端点与 `sample_at` 一律保留 6 位微秒。
+
+```bash
+# 交接整秒之后的半秒单点：只有 CW-2 有效（不产生 MULTIPLE_ACTIVE_CERTIFICATES）
+curl -G "http://localhost:8000/api/coverage/W" \
+  --data-urlencode "start=2026-06-01T00:00:00.500Z" \
+  --data-urlencode "end=2026-06-01T00:00:00.500Z"
+```
+
+```jsonc
+{
+  "instrument": "W",
+  "window_start": "2026-06-01T00:00:00.500000Z",
+  "window_end": "2026-06-01T00:00:00.500000Z",
+  "boundary_count": 0,
+  "grid_points": ["2026-06-01T00:00:00.500000Z"],
+  "segment_count": 1,
+  "segments": [
+    {
+      "start": "2026-06-01T00:00:00.500000Z",
+      "end": "2026-06-01T00:00:00.500000Z",
+      "start_inclusive": true, "end_inclusive": true,   // 单点只覆盖该时刻
+      "resolution": "unique", "valid": true,
+      "conflict_codes": [],
+      "sample_at": "2026-06-01T00:00:00.500000Z",      // 精确微秒原样保留
+      "starts": ["CW-2"]
+    }
+  ],
+  "statistics": {"boundaries_in_window": 0, "grid_points": 1,
+                 "point_samples": 1, "interval_samples": 0,
+                 "reports_evaluated": 1}
+}
+```
+
+作为对照，**整秒**交接点 `2026-06-01T00:00:00Z` 仍是闭区间交接，瞬时双证
+冲突照常保留为独立点区段；窗口横跨整秒截止点时（如
+`start=2026-12-31T23:59:59.500Z&end=2027-01-01T00:00:00.500Z`），截止点
+`...00:00:00Z` 本身仍有效（并入左侧、段尾含），其后的 `.500000` 区段断裂
+（左开、段尾含窗口终点）。
+
 区段字段说明：
 
 | 字段 | 含义 |
@@ -393,7 +452,7 @@ curl -G "http://localhost:8000/api/coverage/INST-T1" \
 | `valid` | 代表采样点上唯一成链且无 ERROR |
 | `conflict_codes` | 该区段全部冲突码（去重排序）；合并判定使用冲突码**多重集**（同码出现次数也需一致） |
 | `error_count` / `warning_count` | 代表采样点的 ERROR/WARN 数量 |
-| `sample_at` | 代表评估点：点区段为边界点本身；开区间区段为两端点之间的内部采样时刻（整秒中点；两端相隔 1 秒时为后半秒） |
+| `sample_at` | 代表评估点：点区段为网格点本身；开区间区段为两端点之间的内部采样时刻（跨度 ≥2 秒取整秒中点，相隔 1 秒取后半秒，更短取真实中点）；同态相邻原子合并后保留最左原子的代表点 |
 | `starts` / `conflicts` | 代表采样点的有效起点证书与完整可解释冲突明细（结构同 `/api/reports`） |
 
 特性与约束：
@@ -402,9 +461,10 @@ curl -G "http://localhost:8000/api/coverage/INST-T1" \
   窗口端点恒被包含（首段 `start_inclusive=true`、末段 `end_inclusive=true`）。
 - 状态在边界**两侧开区间相同、但边界点本身不同**（瞬时冲突）时保留点区段；
   状态在边界点与一侧也相同时，该点并入对应区段（端点包含性合并后仍正确）。
-- `start` 晚于 `end` 返回 **422**（中文原因）；缺少 `start`/`end` 返回 **422**；
-  仪器不存在返回 **404**。时间入参按 UTC 解释，建议统一用 `...Z` 格式；
-  内部比较按整秒精度，开区间内部采样不会落回端点。
+- `start` 晚于 `end` 返回 **422**（中文原因，含精确微秒时刻）；缺少 `start`/`end` 返回 **422**；
+  仪器不存在返回 **404**。时间入参按 UTC 解释，建议统一用 `...Z` 格式，
+  可带小数秒（如 `.500Z`）或时区偏移（换算为 UTC 后保留微秒）；
+  有效期边界恒为整秒、按闭区间比较，开区间内部采样不会落回端点，小数秒点保持真实时间顺序。
 - 内置演示数据中，热电偶 `INST-T1` 在 2025 年夏季存在证书断档，
   可直接用本节开头的 curl 观察“有效 → 断档（`INTERVAL_GAP` /
   `NO_ACTIVE_CERTIFICATE`）→ 恢复”的分段效果。
@@ -1623,7 +1683,10 @@ tests/test_undetermined.py   10 个枚举截断“结果未定”测试（undete
                              RESULT_UNDETERMINED 拒绝）
 tests/test_preflight.py      11 个批量提交预检测试
 tests/test_deactivation.py   8 个停用影响评估测试
-tests/test_coverage.py       10 个仪器时间窗覆盖查询测试
+tests/test_coverage.py       16 个仪器时间窗覆盖查询测试（含 6 个小数秒：
+                             交接后半秒单点不双报、截止后同秒报失效、
+                             跨截止点窗口分段、交接秒内窗口、时区偏移
+                             换算保留微秒、反向小数窗口 422）
 tests/test_common_trace.py   12 个批次共同溯源核查测试
 tests/test_measurement_compatibility.py  14 个测量相容性评估测试
 tests/test_calibration.py    28 个校准工位预约测试
