@@ -551,7 +551,8 @@ class CoverageSegment(BaseModel):
         ...,
         description=(
             "该区段代表评估点：点区段为该边界点本身；"
-            "开区间区段为两端点之间的内部采样时刻（整秒中点或半秒）"
+            "开区间区段为两端点之间的内部采样时刻"
+            "（跨度 ≥2 秒取整秒中点，更短取真实中点，可含小数秒）"
         ),
     )
     starts: List[str] = Field(
@@ -565,14 +566,22 @@ class CoverageSegment(BaseModel):
 
 class CoverageWindowReport(BaseModel):
     instrument: str
-    window_start: datetime = Field(..., description="查询窗起点（UTC，含）")
-    window_end: datetime = Field(..., description="查询窗终点（UTC，含）")
+    window_start: datetime = Field(
+        ..., description="查询窗起点（UTC，含；保留输入换算后的微秒精度）"
+    )
+    window_end: datetime = Field(
+        ..., description="查询窗终点（UTC，含；保留输入换算后的微秒精度）"
+    )
     boundary_count: int = Field(
-        ..., description="窗内相关证书/溯源边有效期边界点数量（不含窗口端点）"
+        ..., description="落在闭查询窗内的相关证书/溯源边有效期边界点数量"
+        "（含与窗口端点重合的边界）"
     )
     grid_points: List[datetime] = Field(
         default_factory=list,
-        description="窗口端点与窗内边界点合并去重、升序排列后的完整网格",
+        description=(
+            "窗口端点与窗内边界点合并去重后按真实时间顺序升序排列的完整网格"
+            "（可含小数秒）"
+        ),
     )
     segment_count: int
     segments: List[CoverageSegment] = Field(

@@ -83,6 +83,11 @@ def instrument_time_window_coverage(
     严格连续（一开一闭相接）时合并为一个区段。每段显式标明
     ``start_inclusive`` / ``end_inclusive``，因此证书首尾相接（闭区间）
     时交接点上的瞬时冲突（如瞬时双重有效）不会被相邻区段吞掉。
+
+    窗口端点支持**小数秒**（微秒精度，可带任意时区偏移，换算为 UTC）：
+    整秒边界本身仍按闭区间判定，该秒后的任意小数秒位于边界之后；
+    ``start == end`` 的单点窗口只评估该时刻；``start`` 晚于 ``end``
+    （含仅小数秒级倒置）返回 422。
     """
     try:
         return build_window_report(db, instrument, start, end)

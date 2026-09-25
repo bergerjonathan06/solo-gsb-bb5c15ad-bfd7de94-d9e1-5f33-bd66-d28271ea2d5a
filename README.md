@@ -60,10 +60,11 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（191 个用例）
+pytest -q        # 运行测试（197 个用例）
 ```
 
-> 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
+> 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式；
+> 覆盖查询（4.1 节）的 `start`/`end` 另支持小数秒（微秒）与任意时区偏移。
 
 ---
 
@@ -347,7 +348,7 @@ curl -G "http://localhost:8000/api/coverage/INST-T1" \
   "instrument": "W",
   "window_start": "2026-01-01T00:00:00Z",
   "window_end": "2027-01-01T00:00:00Z",
-  "boundary_count": 1,
+  "boundary_count": 3,                     // 落在闭窗内的边界（含与窗口端点重合者）
   "grid_points": ["2026-01-01T00:00:00Z",
                   "2026-06-01T00:00:00Z",   // 两张证书闭区间交接点
                   "2027-01-01T00:00:00Z"],
@@ -377,7 +378,7 @@ curl -G "http://localhost:8000/api/coverage/INST-T1" \
       "sample_at": "2026-09-16T00:00:00Z", "starts": ["CW-2"]
     }
   ],
-  "statistics": {"boundaries_in_window": 1, "grid_points": 3,
+  "statistics": {"boundaries_in_window": 3, "grid_points": 3,
                  "point_samples": 3, "interval_samples": 2,
                  "reports_evaluated": 5}
 }
@@ -393,7 +394,7 @@ curl -G "http://localhost:8000/api/coverage/INST-T1" \
 | `valid` | 代表采样点上唯一成链且无 ERROR |
 | `conflict_codes` | 该区段全部冲突码（去重排序）；合并判定使用冲突码**多重集**（同码出现次数也需一致） |
 | `error_count` / `warning_count` | 代表采样点的 ERROR/WARN 数量 |
-| `sample_at` | 代表评估点：点区段为边界点本身；开区间区段为两端点之间的内部采样时刻（整秒中点；两端相隔 1 秒时为后半秒） |
+| `sample_at` | 代表评估点：点区段为边界点本身；开区间区段为两端点之间的内部采样时刻（跨度 ≥2 秒取整秒中点，更短取真实中点，可含小数秒） |
 | `starts` / `conflicts` | 代表采样点的有效起点证书与完整可解释冲突明细（结构同 `/api/reports`） |
 
 特性与约束：
@@ -402,12 +403,54 @@ curl -G "http://localhost:8000/api/coverage/INST-T1" \
   窗口端点恒被包含（首段 `start_inclusive=true`、末段 `end_inclusive=true`）。
 - 状态在边界**两侧开区间相同、但边界点本身不同**（瞬时冲突）时保留点区段；
   状态在边界点与一侧也相同时，该点并入对应区段（端点包含性合并后仍正确）。
-- `start` 晚于 `end` 返回 **422**（中文原因）；缺少 `start`/`end` 返回 **422**；
-  仪器不存在返回 **404**。时间入参按 UTC 解释，建议统一用 `...Z` 格式；
-  内部比较按整秒精度，开区间内部采样不会落回端点。
+- `start` 晚于 `end` 返回 **422**（中文原因，含仅小数秒级倒置）；
+  缺少 `start`/`end` 返回 **422**；仪器不存在返回 **404**。
+  时间入参按 UTC 解释，建议统一用 `...Z` 格式；`start`/`end` 也可携带
+  **小数秒（微秒精度）与任意时区偏移**，换算为 UTC 后按真实时间顺序
+  建立网格，开区间内部采样不会落回端点。
 - 内置演示数据中，热电偶 `INST-T1` 在 2025 年夏季存在证书断档，
   可直接用本节开头的 curl 观察“有效 → 断档（`INTERVAL_GAP` /
   `NO_ACTIVE_CERTIFICATE`）→ 恢复”的分段效果。
+
+**小数秒（微秒精度）查询。** 证书/溯源边有效期按整秒登记，整秒边界本身
+仍属于**闭区间**；而窗口端点携带的小数秒位于该整秒**之后**。因此交接
+整秒之后的瞬间只属于后一张证书，不会被误报为双证书冲突；同理，证书
+`valid_until` 所在整秒之后的小数秒已超出有效期，不会被误报为有效。
+单点窗口（`start == end`）只覆盖该时刻：
+
+```bash
+# 本地端口 8000；单点窗口：交接整秒 2026-06-01T00:00:00Z 之后 0.5 秒
+curl -G "http://localhost:8000/api/coverage/W" \
+  --data-urlencode "start=2026-06-01T00:00:00.500Z" \
+  --data-urlencode "end=2026-06-01T00:00:00.500Z"
+```
+
+```jsonc
+{
+  "instrument": "W",
+  "window_start": "2026-06-01T00:00:00.500000Z",  // 响应保留微秒精度
+  "window_end": "2026-06-01T00:00:00.500000Z",
+  "boundary_count": 0,          // 交接整秒边界在该时刻之前，未落入窗内
+  "grid_points": ["2026-06-01T00:00:00.500000Z"],
+  "segment_count": 1,
+  "segments": [
+    {
+      "start": "2026-06-01T00:00:00.500000Z",
+      "end": "2026-06-01T00:00:00.500000Z",
+      "start_inclusive": true, "end_inclusive": true,  // 单点窗口只覆盖该时刻
+      "resolution": "unique", "valid": true,
+      "conflict_codes": [],     // 无误报 MULTIPLE_ACTIVE_CERTIFICATES
+      "sample_at": "2026-06-01T00:00:00.500000Z",
+      "starts": ["CW-2"]
+    }
+  ]
+}
+```
+
+对照：单点 `2026-06-01T00:00:00Z`（整秒边界本身）仍按闭区间判定为瞬时
+双证书（`ambiguous` + `MULTIPLE_ACTIVE_CERTIFICATES`）；带时区偏移的
+小数秒（如 `2026-06-01T08:00:00.500+08:00`）换算后与
+`2026-06-01T00:00:00.500Z` 等效。
 
 #### 4.2）校准工位预约（GET /api/calibration-slots + POST /api/calibration-bookings）
 

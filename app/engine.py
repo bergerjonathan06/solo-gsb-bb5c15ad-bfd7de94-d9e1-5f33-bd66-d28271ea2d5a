@@ -1681,15 +1681,36 @@ def assess_deactivation(
 
 # ---------------------------------------------------------------- 仪器时间窗覆盖查询
 
-def _parse_ts(s: str) -> datetime:
-    """内部采样串解析（接受整秒 UTC 串及 ``Z\x7f`` 后缀的半开哨兵串）。"""
-    return datetime.strptime(s.rstrip("\x7f"), _TS_PARSE_FMT)
+def _eval_key(dt_value: datetime) -> str:
+    """时点评估用的内部比较串（字符串序 == 真实时间序）。
+
+    库中证书/边的有效期按整秒 ``...Z`` 文本存储并按字典序比较：
+
+    * 整秒时刻直接给出 ``tZ`` —— 与库中文本一致，整秒边界本身仍属于闭区间；
+    * 小数秒时刻在整秒串后追加 ``\\x7f`` 哨兵与 6 位微秒，使
+      ``tZ < tZ\\x7fμμμμμμ < (t+1s)Z`` —— 该秒后的任意小数秒严格位于
+      整秒边界之后，且同一秒内按微秒保序。
+
+    内部串只用于本次查询的比较，既不入库也不出现在响应中。
+    """
+    base = fmt(dt_value)
+    if dt_value.microsecond:
+        base += f"\x7f{dt_value.microsecond:06d}"
+    return base
+
+
+def _display_ts(dt_value: datetime) -> str:
+    """对外展示用 UTC 串（整秒为 Z 结尾，小数秒保留 6 位微秒）。"""
+    base = dt_value.strftime(_TS_PARSE_FMT[:-1])  # 去掉结尾 Z
+    if dt_value.microsecond:
+        base += f".{dt_value.microsecond:06d}"
+    return base + "Z"
 
 
 def _collect_relevant_boundaries(
-    cat: Catalog, instrument_code: str, lo_s: str, hi_s: str
-) -> set[str]:
-    """收集窗口内与该仪器溯源评估相关的全部有效期边界。
+    cat: Catalog, instrument_code: str, lo_dt: datetime, hi_dt: datetime
+) -> set[datetime]:
+    """收集窗口内与该仪器溯源评估相关的全部有效期边界（真实时刻）。
 
     范围 = 该仪器全部证书 → 沿“子→父”边闭包可达的全部证书与边
     （国家基准证书一并纳入，保证根节点检查一致）；各证书/边的
@@ -1714,11 +1735,12 @@ def _collect_relevant_boundaries(
         for e in cat.out_edges.get(cid, []):
             stack.append(e["parent_cert_id"])
 
-    boundaries: set[str] = set()
+    boundaries: set[datetime] = set()
 
     def clamp_add(ts: str) -> None:
-        if lo_s <= ts <= hi_s:
-            boundaries.add(ts)
+        dt = datetime.strptime(ts, _TS_PARSE_FMT)
+        if lo_dt <= dt <= hi_dt:
+            boundaries.add(dt)
 
     for cid in relevant_certs:
         c = cat.certs[cid]
@@ -1730,21 +1752,16 @@ def _collect_relevant_boundaries(
     return boundaries
 
 
-def _interior_moment(lo_s: str, hi_s: str) -> tuple[str, datetime]:
-    """两个整秒网格点之间严格位于内部的采样时刻。
+def _interior_moment(lo_dt: datetime, hi_dt: datetime) -> datetime:
+    """两个相邻网格点之间严格位于内部的采样时刻。
 
-    跨度 >=2 秒取整秒中点；跨度 1 秒时取后半秒，并在内部串上追加
-    ``\\x7f`` 哨兵后缀，使其字符串序严格位于整秒点 ``tZ`` 与
-    ``t+1sZ`` 之间（时间存储串按字典序比较）。内部串只用于本次查询，
-    既不入库也不出现在响应中（响应的 sample_at 给出真实采样时刻）。
+    跨度 >=2 秒取整秒中点；不足 2 秒取真实中点（可含小数秒），
+    不会落回任一端点。
     """
-    lo_dt, hi_dt = _parse_ts(lo_s), _parse_ts(hi_s)
     mid = lo_dt + (hi_dt - lo_dt) / 2
     if (hi_dt - lo_dt) >= timedelta(seconds=2):
-        sample = mid.replace(microsecond=0)
-    else:
-        sample = mid
-    return fmt(sample) + ("\x7f" if sample.microsecond else ""), sample
+        return mid.replace(microsecond=0)
+    return mid
 
 
 def _sample_key(report: dict[str, Any]) -> tuple:
@@ -1753,12 +1770,21 @@ def _sample_key(report: dict[str, Any]) -> tuple:
     return (report["resolution"], report["valid"], codes)
 
 
-def _display_ts(dt_value: datetime) -> str:
-    """对外展示用 UTC 串（整秒为 Z 结尾，半开采样保留微秒）。"""
-    base = dt_value.strftime(_TS_PARSE_FMT[:-1])  # 去掉结尾 Z
-    if dt_value.microsecond:
-        base += f".{dt_value.microsecond:06d}"
-    return base + "Z"
+def _report_at_moment(
+    cat: Catalog, instrument_code: str, moment: datetime
+) -> dict[str, Any]:
+    """在真实时刻（可含小数秒）评估一次时点校验报告。
+
+    评估串经 ``_eval_key`` 编码；含小数秒时把冲突消息中出现的内部
+    编码串替换回真实时刻的展示串，内部编码不泄漏到响应中。
+    """
+    key = _eval_key(moment)
+    report = _build_report(cat, instrument_code, key)
+    display = _display_ts(moment)
+    if key != display:
+        for conflict in report["conflicts"]:
+            conflict["message"] = conflict["message"].replace(key, display)
+    return report
 
 
 def build_window_report(
@@ -1774,40 +1800,42 @@ def build_window_report(
     3. 仅当状态、有效性、冲突码多重集相同且端点严格连续时才合并，
        每段显式标明 start_inclusive / end_inclusive，
        避免闭区间交接时吞掉仅存在于瞬时（边界点）的冲突。
+
+    窗口端点保留输入时区换算后的微秒精度，网格按真实时间顺序排列：
+    整秒边界本身仍属于闭区间，该秒后的任意小数秒位于边界之后
+    （见 ``_eval_key``）；单点窗口（start == end）只覆盖该时刻。
     """
     start_naive = to_utc_naive(start)
     end_naive = to_utc_naive(end)
     if start_naive > end_naive:
         raise ValidationError(
-            f"时间窗起点 {fmt(start_naive)} 不能晚于终点 {fmt(end_naive)}"
+            f"时间窗起点 {_display_ts(start_naive)} "
+            f"不能晚于终点 {_display_ts(end_naive)}"
         )
-    lo_s = fmt(start_naive)
-    hi_s = fmt(end_naive)
 
     instrument = get_instrument(conn, instrument_code)
     if instrument is None:
         raise KeyError(instrument_code)
 
     cat = Catalog(conn)
-    boundaries = _collect_relevant_boundaries(cat, instrument_code, lo_s, hi_s)
-    grid = sorted({lo_s, hi_s, *boundaries})
+    boundaries = _collect_relevant_boundaries(
+        cat, instrument_code, start_naive, end_naive
+    )
+    grid = sorted({start_naive, end_naive, *boundaries})
 
     # 原子段：(起点, 终点, 起点是否包含, 终点是否包含, 代表报告, 真实采样时刻)
-    atoms: list[tuple[str, str, bool, bool, dict[str, Any], datetime]] = []
+    atoms: list[tuple[datetime, datetime, bool, bool, dict[str, Any], datetime]] = []
     for idx, t in enumerate(grid):
-        if lo_s <= t <= hi_s:
-            atoms.append(
-                (t, t, True, True, _build_report(cat, instrument_code, t),
-                 _parse_ts(t))
-            )
+        atoms.append(
+            (t, t, True, True, _report_at_moment(cat, instrument_code, t), t)
+        )
         if idx + 1 < len(grid):
             t1, t2 = grid[idx], grid[idx + 1]
-            if t1 < t2 and lo_s <= t1 and t2 <= hi_s:
-                inner_s, inner_dt = _interior_moment(t1, t2)
-                atoms.append(
-                    (t1, t2, False, False,
-                     _build_report(cat, instrument_code, inner_s), inner_dt)
-                )
+            inner_dt = _interior_moment(t1, t2)
+            atoms.append(
+                (t1, t2, False, False,
+                 _report_at_moment(cat, instrument_code, inner_dt), inner_dt)
+            )
 
     # 相邻且键相同才合并；端点包含性取最左/最右原子段
     merged: list[dict[str, Any]] = []
@@ -1817,18 +1845,18 @@ def build_window_report(
             prev = merged[-1]
             contiguous = (
                 prev["_key"] == key
-                and prev["end"] == a_lo
+                and prev["_end"] == a_lo
                 and prev["end_inclusive"] != a_lo_in
             )
             if contiguous:
-                prev["end"] = a_hi
+                prev["_end"] = a_hi
                 prev["end_inclusive"] = a_hi_in
                 continue
         merged.append(
             {
                 "_key": key,
-                "start": a_lo,
-                "end": a_hi,
+                "_start": a_lo,
+                "_end": a_hi,
                 "start_inclusive": a_lo_in,
                 "end_inclusive": a_hi_in,
                 "_rep": rep,
@@ -1838,26 +1866,31 @@ def build_window_report(
 
     segments = []
     for m in merged:
-        rep = m.pop("_rep")
-        sample_dt = m.pop("_sample_at")
-        m.pop("_key")
-        m["resolution"] = rep["resolution"]
-        m["valid"] = rep["valid"]
-        m["conflict_codes"] = sorted({c["code"] for c in rep["conflicts"]})
-        m["error_count"] = rep["error_count"]
-        m["warning_count"] = rep["warning_count"]
-        m["sample_at"] = _display_ts(sample_dt)
-        m["starts"] = rep["starts"]
-        m["conflicts"] = rep["conflicts"]
-        m["statistics"] = rep["statistics"]
-        segments.append(m)
+        rep = m["_rep"]
+        segments.append(
+            {
+                "start": _display_ts(m["_start"]),
+                "end": _display_ts(m["_end"]),
+                "start_inclusive": m["start_inclusive"],
+                "end_inclusive": m["end_inclusive"],
+                "resolution": rep["resolution"],
+                "valid": rep["valid"],
+                "conflict_codes": sorted({c["code"] for c in rep["conflicts"]}),
+                "error_count": rep["error_count"],
+                "warning_count": rep["warning_count"],
+                "sample_at": _display_ts(m["_sample_at"]),
+                "starts": rep["starts"],
+                "conflicts": rep["conflicts"],
+                "statistics": rep["statistics"],
+            }
+        )
 
     return {
         "instrument": instrument_code,
-        "window_start": lo_s,
-        "window_end": hi_s,
+        "window_start": _display_ts(start_naive),
+        "window_end": _display_ts(end_naive),
         "boundary_count": len(boundaries),
-        "grid_points": grid,
+        "grid_points": [_display_ts(t) for t in grid],
         "segment_count": len(segments),
         "segments": segments,
         "statistics": {
